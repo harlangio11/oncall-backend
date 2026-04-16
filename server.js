@@ -57,8 +57,9 @@ async function initDb() {
     );
 
     CREATE TABLE IF NOT EXISTS device_tokens (
-      user_id   UUID REFERENCES users(id) ON DELETE CASCADE,
-      token     TEXT NOT NULL,
+      user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+      token      TEXT,
+      voip_token TEXT,
       updated_at TIMESTAMPTZ DEFAULT NOW(),
       PRIMARY KEY (user_id)
     );
@@ -137,40 +138,49 @@ function getApnProvider() {
   return _apnProvider;
 }
 
-async function sendPush(deviceToken, { title, body, callerName, callerNumber, type }) {
+/**
+ * sendPush — send APNs notification to a device
+ *
+ * @param deviceToken  APNs or VoIP token
+ * @param payload      Notification content
+ * @param isVoIP       true → send to .voip topic (PushKit); false → regular APNs
+ */
+async function sendPush(deviceToken, { title, body, callerName, callerPhone, type }, isVoIP = false) {
   const provider = getApnProvider();
   if (!provider || !deviceToken) return;
 
   const bundleId = process.env.APNS_BUNDLE_ID || 'com.harlangiordano.oncall';
-
-  // VoIP pushes for calls (PushKit) — rings through silent mode via CallKit
-  // Regular critical alert for emails
-  const isCall  = type === 'call';
-  const topic   = isCall ? `${bundleId}.voip` : bundleId;
+  const isCall   = type === 'call';
 
   const note = new apn.Notification();
-  note.topic  = topic;
   note.expiry = Math.floor(Date.now() / 1000) + 3600;
 
-  if (isCall) {
-    // VoIP push — app receives this via PushKit, presents CallKit UI
+  if (isVoIP && isCall) {
+    // ── VoIP push via PushKit → app presents CallKit UI → rings through silent ──
+    note.topic = `${bundleId}.voip`;
+    note.pushType = 'voip';
     note.payload = {
       type:         'vip_call',
-      callerName:   callerName || callerNumber,
-      callerNumber: callerNumber,
-      aps:          {},
+      callerName:   callerName,
+      callerPhone:  callerPhone,
+      alarmType:    'call',
     };
-  } else {
-    // Email alert — critical alert notification
-    note.alert = { title, body };
-    note.sound = { critical: 1, name: 'alarm.wav', volume: 1.0 };
+  } else if (isCall) {
+    // ── Fallback: critical alert for calls (no VoIP token registered) ──
+    note.topic = bundleId;
+    note.alert = { title: title || `${callerName} is calling`, body: body || 'VIP contact' };
+    note.sound = { critical: 1, name: 'default', volume: 1.0 };
     note.contentAvailable = true;
     note.interruptionLevel = 'critical';
-    note.payload = {
-      type:        'vip_email',
-      callerName:  callerName,
-      contactInfo: callerNumber,
-    };
+    note.payload = { type: 'vip_call', callerName, callerPhone };
+  } else {
+    // ── Email alert — critical alert ──
+    note.topic = bundleId;
+    note.alert = { title, body };
+    note.sound = { critical: 1, name: 'default', volume: 1.0 };
+    note.contentAvailable = true;
+    note.interruptionLevel = 'critical';
+    note.payload = { type: 'vip_email', callerName, alarmType: 'email' };
   }
 
   try {
@@ -294,21 +304,36 @@ app.post('/auth/apple', async (req, res) => {
 
 /**
  * POST /user/register
- * Body: { deviceToken }
- * Saves/updates the APNs device token for this user.
+ * Body: { deviceToken?, voipToken? }
+ * Saves/updates the APNs device token and/or VoIP (PushKit) token for this user.
+ * At least one token field is required.
  */
 app.post('/user/register', requireAuth, async (req, res) => {
-  const { deviceToken } = req.body;
-  if (!deviceToken) return res.status(400).json({ error: 'deviceToken required' });
+  const { deviceToken, voipToken } = req.body;
+  if (!deviceToken && !voipToken) {
+    return res.status(400).json({ error: 'deviceToken or voipToken required' });
+  }
 
-  await db.query(
-    `INSERT INTO device_tokens (user_id, token, updated_at)
-     VALUES ($1, $2, NOW())
-     ON CONFLICT (user_id) DO UPDATE SET token = $2, updated_at = NOW()`,
-    [req.user.userId, deviceToken]
-  );
+  if (deviceToken) {
+    await db.query(
+      `INSERT INTO device_tokens (user_id, token, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET token = $2, updated_at = NOW()`,
+      [req.user.userId, deviceToken]
+    );
+    console.log(`[Register] APNs token updated for user ${req.user.userId}`);
+  }
 
-  console.log(`[Register] Device token updated for user ${req.user.userId}`);
+  if (voipToken) {
+    await db.query(
+      `INSERT INTO device_tokens (user_id, voip_token, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET voip_token = $2, updated_at = NOW()`,
+      [req.user.userId, voipToken]
+    );
+    console.log(`[Register] VoIP token updated for user ${req.user.userId}`);
+  }
+
   res.json({ success: true });
 });
 
@@ -421,14 +446,21 @@ app.post('/twilio/incoming-call', async (req, res) => {
 
   const userId = numRow.rows[0].user_id;
 
-  // Load user's VIP list and device token in parallel
+  // Load user's VIP list and device tokens in parallel
   const [vipRows, tokenRow] = await Promise.all([
     db.query('SELECT name, phone_number FROM vip_contacts WHERE user_id = $1 AND phone_number IS NOT NULL', [userId]),
-    db.query('SELECT token FROM device_tokens WHERE user_id = $1', [userId]),
+    db.query('SELECT token, voip_token FROM device_tokens WHERE user_id = $1', [userId]),
   ]);
 
   if (!tokenRow.rows.length) {
     console.warn('[Twilio] No device token for user:', userId);
+    return sendTwimlHangup(res);
+  }
+
+  const { token: apnsToken, voip_token: voipToken } = tokenRow.rows[0];
+
+  if (!apnsToken && !voipToken) {
+    console.warn('[Twilio] No tokens registered for user:', userId);
     return sendTwimlHangup(res);
   }
 
@@ -441,7 +473,7 @@ app.post('/twilio/incoming-call', async (req, res) => {
     return sendTwimlHangup(res);
   }
 
-  const displayName = vip.name || callerName || callerNumber;
+  const displayName = vip.name || callerNumber;
   console.log(`[Twilio] VIP call from "${displayName}" → firing push for user ${userId}`);
 
   // Log alarm event
@@ -450,14 +482,18 @@ app.post('/twilio/incoming-call', async (req, res) => {
     [userId, displayName, callerNumber, 'call']
   );
 
-  // Fire push
-  await sendPush(tokenRow.rows[0].token, {
+  // Prefer VoIP push (PushKit → CallKit, rings through silent mode)
+  // Fall back to regular APNs critical alert if no VoIP token
+  const pushToken = voipToken || apnsToken;
+  const isVoIP = !!voipToken;
+
+  await sendPush(pushToken, {
     title:        `${displayName} is calling`,
     body:         'Your VIP is trying to reach you',
     callerName:   displayName,
-    callerNumber: callerNumber,
+    callerPhone:  callerNumber,
     type:         'call',
-  });
+  }, isVoIP);
 
   sendTwimlHangup(res);
 });
@@ -649,7 +685,7 @@ async function checkGmailForUser(row) {
       title:        `📧 ${matchedVip.name} emailed you`,
       body:         subject,
       callerName:   matchedVip.name,
-      callerNumber: matchedVip.email,
+      callerPhone:  matchedVip.email,
       type:         'email',
     });
 
